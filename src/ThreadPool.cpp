@@ -1,6 +1,9 @@
 #include "ThreadPool.h"
 
-ThreadPool::ThreadPool(std::size_t threadCount) {
+ThreadPool::ThreadPool(std::size_t threadCount, std::size_t taskPoolSize)
+    : taskPool_(sizeof(TaskNode), taskPoolSize) {
+    // ★ 这里的 taskPoolSize 语义变了：表示每个线程每次去全局池“批发”多少个块
+
     if (threadCount == 0) {
         threadCount = 1;
     }
@@ -16,7 +19,8 @@ ThreadPool::~ThreadPool() {
         std::lock_guard<std::mutex> lock(mutex_);
         stop_ = true;
     }
-    cv_.notify_all(); //叫醒所有睡着的线程
+    // ★ 删掉了 taskPool_.shutdown(); 因为新池子根本没有这个方法
+    cv_.notify_all();
 
     for (auto& t : workers_) {
         if (t.joinable()) {
@@ -25,36 +29,30 @@ ThreadPool::~ThreadPool() {
     }
 }
 
-//void ThreadPool::submit(std::function<void()> task) {
-//    {
-//        std::lock_guard<std::mutex> lock(mutex_);
-//        if (stop_) {
-//            return; // 池子已经关了，直接丢
-//        }
-//        tasks_.push(std::move(task));
-//    }
-//    cv_.notify_one();//只叫醒一个线程
-//}
-
 void ThreadPool::workerLoop() {
     while (true) {
-        std::function<void()> task;
+        TaskNode* node = nullptr;
 
         {
             std::unique_lock<std::mutex> lock(mutex_);
             cv_.wait(lock, [this]() {
                 return stop_ || !tasks_.empty();
-                //（线程池要关闭） OR （有任务要执行）
                 });
 
             if (stop_ && tasks_.empty()) {
                 return;
             }
 
-            task = std::move(tasks_.front());
+            node = tasks_.front();
             tasks_.pop();
         }
 
-        task();
+        node->fn();
+
+        // ★ 显式析构，释放 std::function 内部资源
+        node->~TaskNode();
+
+        // 再归还给池子
+        taskPool_.deallocate(node);
     }
 }

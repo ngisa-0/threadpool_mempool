@@ -11,32 +11,41 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
+#include <new>
+
+#include "ThreadCachePool.h" // ★ 改成包含新头文件
 
 class ThreadPool {
 public:
-    explicit ThreadPool(std::size_t threadCount);
+    explicit ThreadPool(std::size_t threadCount,
+        std::size_t taskPoolSize = 1024);
     ~ThreadPool();
 
     ThreadPool(const ThreadPool&) = delete;
     ThreadPool& operator=(const ThreadPool&) = delete;
 
-    // 简单版：无参数、无返回值的任务
-    //void submit(std::function<void()> task);
-
-    // 通用版：任意函数、任意参数、返回 future
     template <typename F, typename... Args>
     auto submit(F&& f, Args&&... args)
         -> std::future<std::invoke_result_t<F, Args...>>;
 
 private:
+    // 任务节点，固定大小
+    struct TaskNode {
+        std::function<void()> fn;
+        TaskNode* next;   // 预留：将来可挂成自由链表
+    };
+
     void workerLoop();
 
-    std::vector<std::thread>          workers_;
-    std::queue<std::function<void()>> tasks_;
-    std::mutex                        mutex_;
-    std::condition_variable           cv_;
-    bool                              stop_ = false;
+    std::vector<std::thread> workers_;
+    std::queue<TaskNode*>    tasks_;
+    ThreadCachePool          taskPool_;  // ★ 替换为 ThreadCachePool
+    std::mutex               mutex_;
+    std::condition_variable  cv_;
+    bool                     stop_ = false;
 };
+
+// ============ 模板实现 ============
 
 template <typename F, typename... Args>
 auto ThreadPool::submit(F&& f, Args&&... args)
@@ -44,26 +53,28 @@ auto ThreadPool::submit(F&& f, Args&&... args)
 
     using ReturnType = std::invoke_result_t<F, Args...>;
 
-    // 把 f 和 args 打包成 packaged_task
     auto task = std::make_shared<std::packaged_task<ReturnType()>>(
         std::bind(std::forward<F>(f), std::forward<Args>(args)...)
     );
-	
-    //std::bind:把函数和参数绑定成一个可调用对象，返回一个新的可调用对象。
-    //std::forward 完美转发:把参数原样转发，保留它是左值还是右值，不强行拷贝。
-	//std::packaged_task:把一个可调用对象包装成一个任务，可以异步执行，并且可以获取返回值。
-	//std::make_shared:创建一个共享指针，管理动态分配的对象，避免手动释放内存。
-
     std::future<ReturnType> fut = task->get_future();
 
-    // 转成 std::function<void()> 塞进队列
+    // ★ ThreadCachePool 不会返回 nullptr，直接拿
+    TaskNode* node = static_cast<TaskNode*>(taskPool_.allocate());
+
+    // ★ 关键：在 raw 内存上构造 TaskNode
+    new (node) TaskNode{};
+
+    node->fn = [task]() { (*task)(); };
+
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (stop_) {
-            // 池子已关，扔一个异常给调用者
+            // ★ 归还前先析构，否则 std::function 内的资源泄漏
+            node->~TaskNode();
+            taskPool_.deallocate(node);
             throw std::runtime_error("submit on stopped ThreadPool");
         }
-        tasks_.push([task]() { (*task)(); });
+        tasks_.push(node);
     }
     cv_.notify_one();
 
