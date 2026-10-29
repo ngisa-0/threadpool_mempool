@@ -1,3 +1,17 @@
+option(ENABLE_ASAN "Enable AddressSanitizer (debug only)" OFF)
+
+if (ENABLE_ASAN)
+    if (MSVC)
+        add_compile_options(/fsanitize=address)
+        add_link_options(/fsanitize=address)
+        # 关闭增量链接，MSVC 要求
+        add_link_options(/INCREMENTAL:NO)
+    else()
+        add_compile_options(-fsanitize=address -fno-omit-frame-pointer -g)
+        add_link_options(-fsanitize=address)
+    endif()
+endif()
+
 cmake_minimum_required(VERSION 3.16)
 
 project(threadpool_mempool LANGUAGES CXX)
@@ -6,10 +20,28 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-add_executable(tpmp
-    src/main.cpp
+# 把核心代码抽成静态库
+add_library(core STATIC
     src/ThreadPool.cpp
     src/MemoryPool.cpp
+    src/ThreadLocalPool.cpp
+    src/ThreadCachePool.cpp
 )
+target_include_directories(core PUBLIC include)
 
-target_include_directories(tpmp PRIVATE include)
+# 主程序
+add_executable(tpmp src/main.cpp )
+target_link_libraries(tpmp PRIVATE core)
+
+# benchmark 1：new/delete vs MemoryPool
+add_executable(bench_mempool bench/bench_mempool.cpp )
+target_link_libraries(bench_mempool PRIVATE core)
+
+add_executable(bench_mempool_mt bench/bench_mempool_mt.cpp)
+target_link_libraries(bench_mempool_mt PRIVATE core)
+
+add_executable(bench_tlpool_mt bench/bench_tlpool_mt.cpp)
+target_link_libraries(bench_tlpool_mt PRIVATE core)
+
+add_executable(bench_tcache_mt bench/bench_tcache_mt.cpp)
+target_link_libraries(bench_tcache_mt PRIVATE core)
